@@ -1,0 +1,97 @@
+# Tester-env build for Offen (v1.4.2 baseline).
+# Mirrors upstream build/Dockerfile.build stages (node:16 frontends + Go server)
+# but restructured for the mutation workflow:
+#   - Go module downloads are cached in their own layer (COPY go.mod/go.sum first)
+#   - Go build cache uses a BuildKit cache mount so small source edits recompile fast
+#   - Final runtime is a single container on port 3000 (OFFEN_SERVER_PORT)
+# Build context is the prospect root (.work/prospects/offen).
+
+# ---- JS frontend base (same as upstream) ----
+FROM node:16-alpine AS offen_node
+RUN apk add git
+RUN apk add --no-cache --virtual .gyp python3 make g++
+RUN npm i -g npm@6
+COPY ./packages /code/packages
+ENV ADBLOCK=true
+ENV DISABLE_OPENCOLLECTIVE=true
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+
+FROM offen_node AS auditorium
+ARG skip_locales
+ENV SKIP_LOCALES=$skip_locales
+COPY ./auditorium/package.json ./auditorium/package-lock.json /code/deps/
+WORKDIR /code/deps
+RUN npm ci
+COPY ./auditorium /code/auditorium
+COPY ./banner.txt /code/banner.txt
+COPY ./locales /code/auditorium/locales
+WORKDIR /code/auditorium
+RUN cp -a /code/deps/node_modules /code/auditorium/
+ENV NODE_ENV=production
+RUN npm run build
+
+FROM offen_node AS script
+ARG skip_locales
+ENV SKIP_LOCALES=$skip_locales
+COPY ./script/package.json ./script/package-lock.json /code/deps/
+WORKDIR /code/deps
+RUN npm ci
+COPY ./script /code/script
+COPY ./banner.txt /code/banner.txt
+COPY ./locales /code/script/locales
+WORKDIR /code/script
+RUN cp -a /code/deps/node_modules /code/script/
+ENV NODE_ENV=production
+RUN npm run build
+
+FROM offen_node AS vault
+ARG skip_locales
+ENV SKIP_LOCALES=$skip_locales
+COPY ./vault/package.json ./vault/package-lock.json /code/deps/
+WORKDIR /code/deps
+RUN npm ci
+COPY ./vault /code/vault
+COPY ./banner.txt /code/banner.txt
+COPY ./locales /code/vault/locales
+WORKDIR /code/vault
+RUN cp -a /code/deps/node_modules /code/vault/
+ENV NODE_ENV=production
+RUN npm run build
+
+# ---- Go server build with dependency caching ----
+# NOTE: debian-based (glibc) like upstream's xgo compiler image. Alpine/musl
+# toolchains (golang:1.22-alpine, alpine 3.21+) cannot compile the pinned
+# mattn/go-sqlite3 v1.14.8 (pread64/pwrite64/off64_t removed from musl).
+FROM golang:1.22-bookworm AS gobuild
+RUN apt-get update && apt-get install -y --no-install-recommends gcc && rm -rf /var/lib/apt/lists/*
+WORKDIR /src/server
+# Dependency layer: invalidated only when go.mod/go.sum change.
+COPY ./server/go.mod ./server/go.sum ./
+RUN go mod download
+# Source layer: small mutations only invalidate layers below this line.
+COPY ./server/ ./
+COPY --from=script /code/script/dist ./public/static/
+COPY --from=vault /code/vault/dist ./public/static/
+COPY --from=auditorium /code/auditorium/dist ./public/static/
+# The vault is loaded at /vault (without a trailing slash), so its lazy
+# split-require chunks resolve from /. Keep copies beside each locale bundle.
+RUN for dir in ./public/static/*/vault; do cp "$dir"/chunk-*.js "${dir%/vault}/"; done
+COPY ./locales/* ./public/static/locales/
+ARG rev=none
+RUN --mount=type=cache,target=/root/.cache/go-build \
+  CGO_ENABLED=1 go build -trimpath -buildvcs=false \
+  -tags 'osusergo netgo static_build sqlite_omit_load_extension' \
+  -ldflags "-s -w -X github.com/offen/offen/server/config.Revision=$rev" \
+  -o /out/offen ./cmd/offen
+
+# ---- Runtime (single container, SQLite default, glibc to match build) ----
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget && rm -rf /var/lib/apt/lists/*
+COPY --from=gobuild /out/offen /sbin/offen
+RUN mkdir -p /var/opt/offen /etc/offen
+ENV OFFEN_SERVER_PORT=3000
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=5s --retries=5 \
+  CMD wget -qO- http://localhost:3000/healthz || exit 1
+ENTRYPOINT ["offen"]
+CMD ["serve"]

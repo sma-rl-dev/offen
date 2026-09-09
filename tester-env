@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Offen - Tester Environment CLI
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+# Commands: deploy, seed, verify, reset, stop, logs, status
+#
+# Single-container SQLite deployment built from editable source
+# (Dockerfile.tester-env). Deterministic root account is created
+# via `offen setup` during deploy; deleting the data volume resets.
+
+RUN_ID="default"
+PORT="8031"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TESTER_ENV_PROJECT="${TESTER_ENV_PROJECT:-tester-env}"
+TESTER_ENV_APP="${TESTER_ENV_APP:-offen}"
+TESTER_ENV_SCENARIO="${TESTER_ENV_SCENARIO:-manual}"
+
+# Deterministic credentials (local test env only).
+OFFEN_NAME="${OFFEN_NAME:-Test Instance}"
+OFFEN_EMAIL="${OFFEN_EMAIL:-admin@offen.local}"
+OFFEN_PASSWORD="${OFFEN_PASSWORD:-offen-admin-123}"
+OFFEN_EDITOR_EMAIL="${OFFEN_EDITOR_EMAIL:-editor@offen.local}"
+OFFEN_EDITOR_PASSWORD="${OFFEN_EDITOR_PASSWORD:-offen-editor-123}"
+SEED_FILE="${SCRIPT_DIR}/seed.bootstrap.yml"
+SECRET_FILE="${SCRIPT_DIR}/.tester-env-secret"
+DB_PATH="/var/opt/offen/offen.db"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+
+    CONTAINER_NAME="tester-env-offen${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-offen:dev}"
+    DATA_VOLUME="offen-data${suffix}"
+}
+
+ensure_secret() {
+    if [[ -f "${SECRET_FILE}" ]]; then
+        OFFEN_SECRET="$(cat "${SECRET_FILE}")"
+    else
+        OFFEN_SECRET="$(openssl rand -base64 16)"
+        printf '%s' "${OFFEN_SECRET}" > "${SECRET_FILE}"
+        chmod 600 "${SECRET_FILE}"
+        echo "==> Generated instance secret at ${SECRET_FILE}"
+    fi
+}
+
+base_env_args() {
+    # Browser MCP reaches the HTTP app as host.docker.internal. Development
+    # mode prevents Offen from issuing Secure cookies for that local origin.
+    printf '%s' "-e OFFEN_SECRET=${OFFEN_SECRET} -e OFFEN_DATABASE_CONNECTIONSTRING=${DB_PATH} -e OFFEN_APP_DEVELOPMENT=1"
+}
+
+cmd_deploy() {
+    ensure_secret
+    # shellcheck disable=SC2086
+    local env_args
+    env_args="$(base_env_args)"
+
+    echo "==> Building Docker image ${IMAGE_NAME} from source..."
+    docker build \
+        --label "tester-env.project=${TESTER_ENV_PROJECT}" \
+        --label "tester-env.app=${TESTER_ENV_APP}" \
+        --label "tester-env.scenario=${TESTER_ENV_SCENARIO}" \
+        -f "${SCRIPT_DIR}/Dockerfile.tester-env" \
+        -t "${IMAGE_NAME}" \
+        "${SCRIPT_DIR}"
+
+    local has_data=0
+    docker volume inspect "${DATA_VOLUME}" >/dev/null 2>&1 && has_data=1
+    echo "==> Removing any previous container ${CONTAINER_NAME}..."
+    docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+    docker rm "${CONTAINER_NAME}" 2>/dev/null || true
+    docker volume create \
+        --label "tester-env.project=${TESTER_ENV_PROJECT}" \
+        --label "tester-env.app=${TESTER_ENV_APP}" \
+        --label "tester-env.scenario=${TESTER_ENV_SCENARIO}" \
+        --label "tester-env.run_id=${TESTER_ENV_RUN_ID:-${RUN_ID}}" \
+        "${DATA_VOLUME}" >/dev/null
+
+    if [[ "${has_data}" -eq 0 ]]; then
+        echo "==> Running one-off setup (creates root account ${OFFEN_EMAIL})..."
+        # shellcheck disable=SC2086
+        docker run --rm \
+            --label "tester-env.project=${TESTER_ENV_PROJECT}" \
+            --label "tester-env.app=${TESTER_ENV_APP}" \
+            --label "tester-env.scenario=${TESTER_ENV_SCENARIO}" \
+            -v "${DATA_VOLUME}:/var/opt/offen" \
+            ${env_args} \
+            "${IMAGE_NAME}" setup \
+            -name "${OFFEN_NAME}" -email "${OFFEN_EMAIL}" -password "${OFFEN_PASSWORD}"
+    else
+        echo "==> Reusing existing data volume ${DATA_VOLUME}."
+    fi
+
+    echo "==> Starting server on port ${PORT}..."
+    # shellcheck disable=SC2086
+    docker run -d --name "${CONTAINER_NAME}" \
+        --label "tester-env.project=${TESTER_ENV_PROJECT}" \
+        --label "tester-env.app=${TESTER_ENV_APP}" \
+        --label "tester-env.scenario=${TESTER_ENV_SCENARIO}" \
+        --label "tester-env.run_id=${TESTER_ENV_RUN_ID:-${RUN_ID}}" \
+        -p "${PORT}:3000" \
+        -v "${DATA_VOLUME}:/var/opt/offen" \
+        ${env_args} \
+        "${IMAGE_NAME}"
+
+    echo "==> Waiting for app to become healthy..."
+    for i in $(seq 1 30); do
+        if curl -sf "http://localhost:${PORT}/healthz" >/dev/null 2>&1; then
+            echo "==> Deployment complete. App running at http://localhost:${PORT}"
+            echo "==> Login: ${OFFEN_EMAIL} / ${OFFEN_PASSWORD}"
+            return 0
+        fi
+        sleep 2
+    done
+    echo "ERROR: app did not become healthy in time." >&2
+    docker logs "${CONTAINER_NAME}" 2>&1 | tail -30
+    return 1
+}
+
+cmd_seed() {
+    ensure_secret
+    if [[ ! -f "${SEED_FILE}" ]]; then
+        echo "FAIL: seed fixture ${SEED_FILE} not found" >&2; return 1
+    fi
+    if ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
+        echo "FAIL: image ${IMAGE_NAME} not found; run './tester-env deploy' first" >&2; return 1
+    fi
+    if ! docker ps -a --filter "name=^${CONTAINER_NAME}$" --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
+        echo "FAIL: container ${CONTAINER_NAME} not found; run './tester-env deploy' first" >&2; return 1
+    fi
+    # shellcheck disable=SC2086
+    local env_args
+    env_args="$(base_env_args)"
+
+    echo "==> Seeding deterministic accounts/users from seed.bootstrap.yml (-force replaces deploy-time root account)..."
+    docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+    # shellcheck disable=SC2086
+    docker run --rm \
+        --label "tester-env.project=${TESTER_ENV_PROJECT}" \
+        --label "tester-env.app=${TESTER_ENV_APP}" \
+        --label "tester-env.scenario=${TESTER_ENV_SCENARIO}" \
+        -v "${DATA_VOLUME}:/var/opt/offen" \
+        -v "${SEED_FILE}:/seed/seed.bootstrap.yml:ro" \
+        ${env_args} \
+        "${IMAGE_NAME}" setup -source /seed/seed.bootstrap.yml -force
+
+    echo "==> Restarting ${CONTAINER_NAME}..."
+    docker start "${CONTAINER_NAME}" >/dev/null
+    for i in $(seq 1 30); do
+        if curl -sf "http://localhost:${PORT}/healthz" >/dev/null 2>&1; then
+            echo "==> Seed complete: accounts 'Acme Store' + 'Studio Blog', users ${OFFEN_EMAIL} (superadmin, both) + ${OFFEN_EDITOR_EMAIL} (Acme Store only)."
+            return 0
+        fi
+        sleep 2
+    done
+    echo "ERROR: app did not become healthy after seed." >&2
+    docker logs "${CONTAINER_NAME}" 2>&1 | tail -30
+    return 1
+}
+
+cmd_verify() {
+    local fail=0
+    echo "==> Verifying Offen at http://localhost:${PORT} ..."
+    if curl -sf "http://localhost:${PORT}/healthz" >/dev/null; then
+        echo "==> OK: /healthz returns 200"
+    else
+        echo "FAIL: /healthz unreachable" >&2; fail=1
+    fi
+    local landing
+    if landing="$(curl -sf "http://localhost:${PORT}/")"; then
+        echo "==> OK: / returns 200"
+        if printf '%s' "${landing}" | grep -qi 'offen'; then
+            echo "==> OK: landing page mentions Offen"
+        else
+            echo "FAIL: landing page has no Offen marker" >&2; fail=1
+        fi
+    else
+        echo "FAIL: / unreachable" >&2; fail=1
+    fi
+    if curl -sf "http://localhost:${PORT}/vault" >/dev/null; then
+        echo "==> OK: /vault returns 200"
+    else
+        echo "FAIL: /vault unreachable" >&2; fail=1
+    fi
+    local vault_index vault_chunk
+    vault_index="$(curl -sf "http://localhost:${PORT}/vault" | grep -oE '/vault/index-[0-9a-f]+\.js' | grep -m1 . || true)"
+    vault_chunk="$(curl -sf "http://localhost:${PORT}${vault_index}" | grep -oE 'chunk-[0-9]+-[0-9a-f]+\.js' | grep -m1 . || true)"
+    if [[ -n "${vault_chunk}" ]] && curl -sfI "http://localhost:${PORT}/${vault_chunk}" | grep -qi '^Content-Type: text/javascript'; then
+        echo "==> OK: Vault fallback crypto chunk /${vault_chunk} is JavaScript"
+    else
+        echo "FAIL: Vault fallback crypto chunk is not served from its root URL" >&2; fail=1
+    fi
+    local browser_cookie
+    browser_cookie="$(mktemp)"
+    if curl -sf --resolve "host.docker.internal:${PORT}:127.0.0.1" \
+        -c "${browser_cookie}" \
+        -X POST "http://host.docker.internal:${PORT}/api/login" \
+        -H 'Content-Type: application/json' \
+        -d "{\"username\":\"${OFFEN_EMAIL}\",\"password\":\"${OFFEN_PASSWORD}\"}" >/dev/null \
+        && grep -q $'host.docker.internal\tFALSE\t/api\tFALSE\t0\tauth' "${browser_cookie}" \
+        && curl -sf --resolve "host.docker.internal:${PORT}:127.0.0.1" \
+            -b "${browser_cookie}" "http://host.docker.internal:${PORT}/api/login" >/dev/null; then
+        echo "==> OK: host.docker.internal login persists a non-Secure session cookie"
+    else
+        echo "FAIL: host.docker.internal session login failed" >&2; fail=1
+    fi
+    rm -f "${browser_cookie}"
+    if [[ "${fail}" -ne 0 ]]; then
+        echo "==> Verification FAILED" >&2; return 1
+    fi
+    # Seeded accounts/users via API probes (login returns account list).
+    local login_json
+    if login_json="$(curl -sf -X POST "http://localhost:${PORT}/api/login" \
+        -H 'Content-Type: application/json' \
+        -d "{\"username\":\"${OFFEN_EMAIL}\",\"password\":\"${OFFEN_PASSWORD}\"}")"; then
+        echo "==> OK: admin login returns 200"
+        for name in "Acme Store" "Studio Blog"; do
+            if printf '%s' "${login_json}" | grep -q "\"accountName\":\"${name}\""; then
+                echo "==> OK: admin sees account '${name}'"
+            else
+                echo "FAIL: admin login missing account '${name}'" >&2; fail=1
+            fi
+        done
+        if printf '%s' "${login_json}" | grep -q '"adminLevel":1'; then
+            echo "==> OK: admin has superadmin level"
+        else
+            echo "FAIL: admin missing superadmin level" >&2; fail=1
+        fi
+    else
+        echo "FAIL: admin login failed" >&2; fail=1
+    fi
+    local editor_json
+    sleep 2 # login endpoint is rate-limited; space out probes
+    if editor_json="$(curl -sf -X POST "http://localhost:${PORT}/api/login" \
+        -H 'Content-Type: application/json' \
+        -d "{\"username\":\"${OFFEN_EDITOR_EMAIL}\",\"password\":\"${OFFEN_EDITOR_PASSWORD}\"}")"; then
+        echo "==> OK: editor login returns 200"
+        if printf '%s' "${editor_json}" | grep -q '"accountName":"Acme Store"'; then
+            echo "==> OK: editor sees account 'Acme Store'"
+        else
+            echo "FAIL: editor login missing account 'Acme Store'" >&2; fail=1
+        fi
+        if printf '%s' "${editor_json}" | grep -q '"accountName":"Studio Blog"'; then
+            echo "FAIL: editor must not see 'Studio Blog'" >&2; fail=1
+        else
+            echo "==> OK: editor has no access to 'Studio Blog'"
+        fi
+    else
+        echo "FAIL: editor login failed" >&2; fail=1
+    fi
+    if [[ "${fail}" -ne 0 ]]; then
+        echo "==> Verification FAILED" >&2; return 1
+    fi
+    echo "==> Verification complete. Login with ${OFFEN_EMAIL} / ${OFFEN_PASSWORD}"
+}
+
+cmd_reset() {
+    echo "==> Resetting environment (removes container + data volume, keeps image)..."
+    docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+    docker rm "${CONTAINER_NAME}" 2>/dev/null || true
+    docker volume rm "${DATA_VOLUME}" 2>/dev/null || true
+    echo "==> Reset complete. Run './tester-env deploy' to start fresh."
+}
+
+cmd_stop() {
+    echo "==> Stopping container..."
+    docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+    echo "==> Stopped."
+}
+
+cmd_logs() {
+    docker logs -f "${CONTAINER_NAME}" 2>/dev/null || echo "Container not running."
+}
+
+cmd_status() {
+    if docker ps --filter "name=${CONTAINER_NAME}" --format "{{.Names}}" | grep -q "${CONTAINER_NAME}"; then
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Login: ${OFFEN_EMAIL}"
+    else
+        echo "Status: NOT RUNNING"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+Offen - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+   deploy    Build image from source, setup root account, start server
+   seed      Apply seed.bootstrap.yml (-force): 2 accounts + 2 users, restart
+   verify    HTTP checks: /healthz, /, /vault + login/account probes
+  reset     Remove container + data volume (keeps image)
+  stop      Stop container (preserves data)
+  logs      Tail container logs
+  status    Show running state and URL
+
+Env overrides: OFFEN_NAME, OFFEN_EMAIL, OFFEN_PASSWORD, IMAGE_TAG, RUN_ID.
+EOF
+}
+
+refresh_names
+CMD="${1:-help}"
+shift || true
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --run-id) RUN_ID="$2"; shift 2 ;;
+        --port) PORT="$2"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+refresh_names
+
+case "${CMD}" in
+    deploy) cmd_deploy ;;
+    seed) cmd_seed ;;
+    verify) cmd_verify ;;
+    reset) cmd_reset ;;
+    stop) cmd_stop ;;
+    logs) cmd_logs ;;
+    status) cmd_status ;;
+    *) cmd_help ;;
+esac

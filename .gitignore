@@ -26,3 +26,6 @@ docs-site
 
 *.pem
 *.crx
+
+# Local generated secret for tester-env.
+.tester-env-secret
