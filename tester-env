@@ -9,7 +9,7 @@ set -euo pipefail
 # (Dockerfile.tester-env). Deterministic root account is created
 # via `offen setup` during deploy; deleting the data volume resets.
 
-RUN_ID="default"
+RUN_ID="${RUN_ID:-default}"
 PORT="8031"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TESTER_ENV_PROJECT="${TESTER_ENV_PROJECT:-tester-env}"
