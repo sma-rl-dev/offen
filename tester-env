@@ -263,9 +263,16 @@ cmd_verify() {
 
 cmd_reset() {
     echo "==> Resetting environment (removes container + data volume, keeps image)..."
-    docker stop "${CONTAINER_NAME}" 2>/dev/null || true
-    docker rm "${CONTAINER_NAME}" 2>/dev/null || true
-    docker volume rm "${DATA_VOLUME}" 2>/dev/null || true
+    local containers volumes
+    containers="$(docker ps -a --format '{{.Names}}')" || return
+    volumes="$(docker volume ls --format '{{.Name}}')" || return
+    if [[ $'\n'"${containers}"$'\n' == *$'\n'"${CONTAINER_NAME}"$'\n'* ]]; then
+        docker stop "${CONTAINER_NAME}" || return
+        docker rm "${CONTAINER_NAME}" || return
+    fi
+    if [[ $'\n'"${volumes}"$'\n' == *$'\n'"${DATA_VOLUME}"$'\n'* ]]; then
+        docker volume rm "${DATA_VOLUME}" || return
+    fi
     echo "==> Reset complete. Run './tester-env deploy' to start fresh."
 }
 
